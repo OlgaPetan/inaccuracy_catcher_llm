@@ -6,15 +6,10 @@ import pandas as pd
 import streamlit as st
 import os
 
-try:
-    import streamlit as st
-    if "OPENAI_API_KEY" in st.secrets:
-        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
-except ImportError:
-    pass  # Not in Streamlit
-
-if not os.getenv("OPENAI_API_KEY"):
-    raise RuntimeError("OpenAI API key not found. Set it in Streamlit secrets or as an environment variable.")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+if not OPENAI_API_KEY:
+    st.error("OpenAI API key not found. Add OPENAI_API_KEY to Streamlit secrets.")
+    st.stop()
     
 OPENAI_MODEL = "gpt-5.2"  
 
