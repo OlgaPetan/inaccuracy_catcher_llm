@@ -736,8 +736,10 @@ def main():
         st.subheader("Title")
         title_edit = st.text_input("Title", value=title_val, key="__title")
 
-        st.subheader("Amenities (ground truth)")
-        st.write(amenities_val if amenities_val else "—")
+        sst.subheader("Amenities (ground truth)")
+        st.caption(f"Detected {len(amenities_val)} amenities")
+        safe_df(pd.DataFrame({"amenity": amenities_val})) if amenities_val else st.write("—")
+
 
     with c2:
         edited_texts: Dict[str, str] = {}
