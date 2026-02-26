@@ -1389,7 +1389,7 @@ def main():
     #             })
     #         else:
     #             map_rows.append({"canonical": str(canon), "json_key": "", "value": as_display_value(d), "confidence": ""})
-    safe_df(pd.DataFrame(map_rows))
+    # safe_df(pd.DataFrame(map_rows))
 
     df = issues_to_df(issues_display).copy()
     df = df.sort_values(by=["severity", "issue_type"], key=lambda s: s.map(sev_rank), ascending=True)
