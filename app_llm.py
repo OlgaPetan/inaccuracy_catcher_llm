@@ -1376,19 +1376,19 @@ def main():
     m2.metric("Medium", counts.get("medium", 0))
     m3.metric("Low", counts.get("low", 0))
 
-    st.subheader("Field mapping (LLM best-effort)")
-    map_rows = []
-    if isinstance(mapping, dict):
-        for canon, d in mapping.items():
-            if isinstance(d, dict):
-                map_rows.append({
-                    "canonical": str(canon),
-                    "json_key": as_display_value(d.get("key")),
-                    "value": as_display_value(d.get("value")),
-                    "confidence": as_display_value(d.get("confidence")),
-                })
-            else:
-                map_rows.append({"canonical": str(canon), "json_key": "", "value": as_display_value(d), "confidence": ""})
+    # st.subheader("Field mapping (LLM best-effort)")
+    # map_rows = []
+    # if isinstance(mapping, dict):
+    #     for canon, d in mapping.items():
+    #         if isinstance(d, dict):
+    #             map_rows.append({
+    #                 "canonical": str(canon),
+    #                 "json_key": as_display_value(d.get("key")),
+    #                 "value": as_display_value(d.get("value")),
+    #                 "confidence": as_display_value(d.get("confidence")),
+    #             })
+    #         else:
+    #             map_rows.append({"canonical": str(canon), "json_key": "", "value": as_display_value(d), "confidence": ""})
     safe_df(pd.DataFrame(map_rows))
 
     df = issues_to_df(issues_display).copy()
