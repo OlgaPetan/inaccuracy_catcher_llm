@@ -472,6 +472,120 @@ def find_amenity_hits(text: str, canon: str) -> List[Tuple[int, int, str]]:
     hits.sort(key=lambda x: x[0])
     return hits
 
+
+# =========================
+# This fixes the issue with non-important amenities being flagged as inaccuracies
+# =========================
+
+# Only show amenity-related issues if the amenity belongs to one of these categories.
+# This is a DISPLAY policy only (does not change detection).
+IMPORTANT_AMENITY_CATEGORIES = {
+    "Comfort & Wellness",
+    "Convenience & Functionality",
+    "Leisure & Outdoor",
+    "Scenic Views",
+}
+
+def amenity_category_index() -> Dict[str, str]:
+    """
+    Map canonical amenity -> category label using your existing category dictionaries.
+    Used for DISPLAY filtering (not detection).
+    """
+    idx: Dict[str, str] = {}
+    for cat, items in HIGH_INTENT_AMENITIES.items():
+        for it in items:
+            idx[canon_amenity(it)] = cat
+    for cat, items in LOW_PRIORITY_AMENITIES.items():
+        for it in items:
+            idx[canon_amenity(it)] = cat
+    return idx
+
+def important_amenity_set() -> set:
+    """Canonical amenities that are considered important to surface to QA."""
+    idx = amenity_category_index()
+    return {a for a, cat in idx.items() if cat in IMPORTANT_AMENITY_CATEGORIES}
+
+def is_amenity_issue(issue: Dict[str, Any]) -> bool:
+    t = (issue.get("issue_type") or "").lower()
+    return (
+        "amenity" in t
+        or "amenities" in t
+        or "shared vs private" in t
+        or "title amenity" in t
+    )
+
+def _clean_amenity_hint(s: str) -> str:
+    """
+    Normalize issue text like:
+      '2× BBQ grill' -> 'bbq grill'
+      'Shared gym in building' -> 'gym'
+      'private pool' -> 'pool'
+    """
+    x = normalize_ws(s).lower()
+
+    # remove count prefixes like "2x", "2×", "2 x"
+    x = re.sub(r"^\s*\d+\s*[x×]\s*", "", x)
+    x = re.sub(r"^\s*\d+\s+", "", x)
+
+    # remove common modifiers that shouldn't create new amenities
+    x = re.sub(r"\b(shared|private|in\s+building|upon\s+request|available\s+upon\s+request)\b", "", x)
+    x = normalize_ws(x)
+
+    return x.strip()
+
+def guess_issue_amenity_canon(issue: Dict[str, Any]) -> Optional[str]:
+    """
+    Best-effort extraction of a canonical amenity from an issue,
+    using claim -> evidence -> reason (in that order).
+    """
+    for k in ("claim", "evidence", "reason"):
+        raw = issue.get(k) or ""
+        if not isinstance(raw, str):
+            continue
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        cleaned = _clean_amenity_hint(raw)
+
+        # quick shortcut: handle "shared pool" / "private pool" style mentions
+        cleaned = cleaned.replace("shared pool", "pool").replace("private pool", "pool")
+        cleaned = cleaned.replace("shared hot tub", "hot tub").replace("private hot tub", "hot tub")
+
+        if cleaned:
+            return canon_amenity(cleaned)
+
+    return None
+
+def filter_issues_for_qa(issues: List[Dict[str, Any]], show_all: bool = False) -> List[Dict[str, Any]]:
+    """
+    DISPLAY filtering:
+    - Always keep non-amenity issues (capacity, rooms, bathrooms, leakage, etc.)
+    - For amenity issues: only keep if amenity is in IMPORTANT_AMENITY_CATEGORIES
+    """
+    if show_all:
+        return issues
+
+    important = important_amenity_set()
+
+    out: List[Dict[str, Any]] = []
+    for it in issues:
+        if not is_amenity_issue(it):
+            out.append(it)
+            continue
+
+        # Some amenity issues don't have a specific amenity (e.g. "Title amenity stuffing")
+        itype = (it.get("issue_type") or "").lower()
+        if "title amenity stuffing" in itype:
+            out.append(it)
+            continue
+
+        canon = guess_issue_amenity_canon(it)
+        if canon and canon in important:
+            out.append(it)
+
+    return out
+
 def claim_present_in_selected_amenities(claim: str, amenities_selected: List[str]) -> bool:
     """
     Used to suppress LLM false positives when the amenity exists but naming differs.
@@ -1246,10 +1360,16 @@ def main():
     issues = current["issues"]
     mapping = current["mapping"]
 
+    show_all_issues = st.sidebar.checkbox(
+        "Show all issues (including low-importance amenities)",
+        value=False
+    )
+    issues_display = filter_issues_for_qa(issues, show_all=show_all_issues)
+
     st.header("Results")
 
     counts = {"high": 0, "medium": 0, "low": 0}
-    for it in issues:
+    for it in issues_display:
         counts[(it.get("severity") or "low").lower()] = counts.get((it.get("severity") or "low").lower(), 0) + 1
     m1, m2, m3 = st.columns(3)
     m1.metric("High", counts.get("high", 0))
@@ -1271,16 +1391,16 @@ def main():
                 map_rows.append({"canonical": str(canon), "json_key": "", "value": as_display_value(d), "confidence": ""})
     safe_df(pd.DataFrame(map_rows))
 
-    df = issues_to_df(issues).copy()
+    df = issues_to_df(issues_display).copy()
     df = df.sort_values(by=["severity", "issue_type"], key=lambda s: s.map(sev_rank), ascending=True)
     st.subheader("Issues table")
     safe_df(df)
 
     st.download_button("Download issues (CSV)", df.to_csv(index=False).encode("utf-8"), "issues.csv", "text/csv")
-    st.download_button("Download issues (JSON)", json.dumps(issues, ensure_ascii=False, indent=2).encode("utf-8"), "issues.json", "application/json")
+    st.download_button("Download issues (JSON)", json.dumps(issues_display, ensure_ascii=False, indent=2).encode("utf-8"), "issues.json", "application/json")
 
     st.subheader("Issue details (highlights + reasons)")
-    render_issue_cards(issues, title_edit, all_texts_for_checking)
+    render_issue_cards(issues_display, title_edit, all_texts_for_checking)
 
     st.sidebar.header("Runs")
     st.sidebar.write(f"{len(st.session_state.get('runs', []))} run(s) this session")
