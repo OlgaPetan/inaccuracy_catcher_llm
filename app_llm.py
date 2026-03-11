@@ -5,9 +5,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-import os
+
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+
 if not OPENAI_API_KEY:
     st.error("OpenAI API key not found. Add OPENAI_API_KEY to Streamlit secrets.")
     st.stop()
@@ -88,14 +89,11 @@ def safe_df(df: pd.DataFrame):
     except Exception:
         st.dataframe(df.astype(str))
 
-
 def normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
-
 def normalize_key(k: str) -> str:
     return re.sub(r"[^a-z0-9_]+", "_", (k or "").lower()).strip("_")
-
 
 def _collect_strings(obj):
     """Recursively collect non-empty strings from dict/list structures."""
@@ -115,6 +113,7 @@ def _collect_strings(obj):
 
     rec(obj)
 
+    # de-dupe while preserving order
     seen = set()
     res = []
     for s in out:
@@ -123,6 +122,43 @@ def _collect_strings(obj):
             res.append(s)
     return res
 
+def extract_all_amenities(data):
+    """
+    Extract ALL amenities from the JSON, supporting both:
+      - "amenities": [ ... ]
+      - "amenities": { "Family": [...], ... }
+    Also supports amenities nested deeper.
+    Returns a flat list of amenity strings.
+    """
+    found = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                kn = normalize_key(str(k))
+                if "amenit" in kn and isinstance(v, (dict, list)):
+                    found.extend(_collect_strings(v))
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+
+    seen = set()
+    res = []
+    for s in found:
+        if s not in seen:
+            seen.add(s)
+            res.append(s)
+    return res
+
+def is_review_key(k: str) -> bool:
+    kn = normalize_key(k)
+    return ("review" in kn) or ("reviews" in kn)
+
+def is_indexed_path(k: str) -> bool:
+    return bool(re.search(r"(^|\.)\d+(\.|$)", k))
 
 def escape_html(s: str) -> str:
     return (
@@ -130,7 +166,6 @@ def escape_html(s: str) -> str:
         .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         .replace('"', "&quot;").replace("'", "&#39;")
     )
-
 
 def highlight_html(text: str, needle: str, max_chars: int = 380) -> str:
     t = text or ""
@@ -162,7 +197,6 @@ def highlight_html(text: str, needle: str, max_chars: int = 380) -> str:
 
     return f"{pre}<mark>{mid}</mark>{post}"
 
-
 def flatten_json(data: Any, parent: str = "", sep: str = ".") -> Dict[str, Any]:
     out: Dict[str, Any] = {}
 
@@ -182,7 +216,6 @@ def flatten_json(data: Any, parent: str = "", sep: str = ".") -> Dict[str, Any]:
     rec(data, parent)
     return out
 
-
 def detect_title_key(flat: Dict[str, Any]) -> Optional[str]:
     for k, v in flat.items():
         if isinstance(v, str):
@@ -197,15 +230,12 @@ def detect_title_key(flat: Dict[str, Any]) -> Optional[str]:
                 cands.append((len(s), k))
     return sorted(cands)[0][1] if cands else None
 
-
-def is_review_key(k: str) -> bool:
-    kn = normalize_key(k)
-    return ("review" in kn) or ("reviews" in kn)
-
-
-def is_indexed_path(k: str) -> bool:
-    return bool(re.search(r"(^|\.)\d+(\.|$)", k))
-
+def detect_house_rules_key(flat: Dict[str, Any]) -> Optional[str]:
+    # string-based fallback (we handle dict/list in main via find_node_by_key)
+    for k, v in flat.items():
+        if isinstance(v, str) and "house_rules" in normalize_key(k) and len(v.strip()) >= 30:
+            return k
+    return None
 
 def detect_text_keys(flat: Dict[str, Any], min_len: int = 120) -> List[str]:
     keys = []
@@ -216,9 +246,7 @@ def detect_text_keys(flat: Dict[str, Any], min_len: int = 120) -> List[str]:
                 keys.append(k)
     return sorted(keys)
 
-
 PREFERRED_TEXT_NORMAL_KEYS = {"summary", "the_space", "guest_access", "other_things_to_note", "description"}
-
 
 def choose_editable_text_keys(flat: Dict[str, Any], title_key: Optional[str], house_rules_key: Optional[str]) -> List[str]:
     preferred = []
@@ -239,7 +267,6 @@ def choose_editable_text_keys(flat: Dict[str, Any], title_key: Optional[str], ho
             out.append(k)
     return out
 
-
 def build_corpus(title: str, texts: Dict[str, str]) -> Dict[str, str]:
     corpus = {"title": title or ""}
     for k, v in (texts or {}).items():
@@ -248,84 +275,7 @@ def build_corpus(title: str, texts: Dict[str, str]) -> Dict[str, str]:
 
 
 # =========================
-# AMENITIES EXTRACTION (NEW API KEYS)
-# =========================
-
-def extract_all_amenities_fallback(data: Any) -> List[str]:
-    """Fallback: old behavior - collect from any key containing 'amenit'."""
-    found = []
-
-    def walk(obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                kn = normalize_key(str(k))
-                if "amenit" in kn and isinstance(v, (dict, list)):
-                    found.extend(_collect_strings(v))
-                walk(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
-
-    walk(data)
-    seen = set()
-    res = []
-    for s in found:
-        if s not in seen:
-            seen.add(s)
-            res.append(s)
-    return res
-
-
-def extract_amenities_included_not_included(data: Any) -> Tuple[List[str], List[str]]:
-    """
-    New API:
-      - amenities_included
-      - amenities_not_included
-
-    If neither exists, fall back to old extraction and return (all, []).
-    """
-    included: List[str] = []
-    not_included: List[str] = []
-    found_any_new = False
-
-    def walk(obj):
-        nonlocal found_any_new, included, not_included
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                kn = normalize_key(str(k))
-                if kn == "amenities_included" and isinstance(v, (dict, list)):
-                    found_any_new = True
-                    included.extend(_collect_strings(v))
-                elif kn == "amenities_not_included" and isinstance(v, (dict, list)):
-                    found_any_new = True
-                    not_included.extend(_collect_strings(v))
-                walk(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
-
-    walk(data)
-
-    def dedupe(seq: List[str]) -> List[str]:
-        seen = set()
-        res = []
-        for s in seq:
-            if s not in seen:
-                seen.add(s)
-                res.append(s)
-        return res
-
-    included = dedupe(included)
-    not_included = dedupe(not_included)
-
-    if not found_any_new:
-        return extract_all_amenities_fallback(data), []
-
-    return included, not_included
-
-
-# =========================
-# HOUSE RULES (ONLY TEXT BOX SUPPORT)
+# HOUSE RULES (schema-agnostic)
 # =========================
 
 def find_node_by_key(data: Any, target_key: str) -> Optional[Any]:
@@ -348,7 +298,6 @@ def find_node_by_key(data: Any, target_key: str) -> Optional[Any]:
         return None
 
     return rec(data)
-
 
 def house_rules_to_text(hr: Any) -> str:
     """Stable plain-text representation for dict/list/string house rules."""
@@ -390,6 +339,45 @@ def house_rules_to_text(hr: Any) -> str:
         return "\n".join(lines).strip()
 
     return normalize_ws(str(hr))
+
+def render_house_rules_readonly(hr: Any):
+    """
+    Read-only form-like UI:
+    - dict: expanders per section with disabled checkboxes
+    - list: disabled checkboxes
+    - str: disabled textarea
+    """
+    if hr is None:
+        st.write("—")
+        return
+
+    if isinstance(hr, str):
+        st.text_area("House rules", value=hr, height=220, disabled=True)
+        return
+
+    if isinstance(hr, list):
+        for i, item in enumerate(hr):
+            label = str(item) if item is not None else ""
+            if label.strip():
+                st.checkbox(label.strip(), value=False, disabled=True, key=f"__hr_li_{i}")
+        return
+
+    if isinstance(hr, dict):
+        for section, items in hr.items():
+            sec = str(section).strip() if section is not None else "House rules"
+            with st.expander(sec, expanded=True):
+                if isinstance(items, list):
+                    for i, rule in enumerate(items):
+                        label = str(rule) if rule is not None else ""
+                        if label.strip():
+                            st.checkbox(label.strip(), value=False, disabled=True, key=f"__hr_{normalize_key(sec)}_{i}")
+                else:
+                    txt = house_rules_to_text(items)
+                    if txt:
+                        st.text_area("Details", value=txt, height=180, disabled=True, key=f"__hr_txt_{normalize_key(sec)}")
+        return
+
+    st.text_area("House rules", value=house_rules_to_text(hr), height=220, disabled=True)
 
 
 # =========================
@@ -463,7 +451,7 @@ def parse_int_maybe(x: Any) -> Optional[int]:
 
 
 # =========================
-# AMENITY MATCHING (DETERMINISTIC + SOFT)
+# AMENITY (DETERMINISTIC + SOFT MATCHING)
 # =========================
 
 def extract_number_near(text: str, idx: int, window: int = 40) -> Optional[int]:
@@ -481,7 +469,6 @@ def extract_number_near(text: str, idx: int, window: int = 40) -> Optional[int]:
     if toks:
         return word_to_int(toks[-1])
     return None
-
 
 AMENITY_SYNONYMS = {
     "hot tub": ["hot tub", "jacuzzi", "spa tub", "whirlpool", "spa"],
@@ -579,7 +566,7 @@ def find_amenity_hits(text: str, canon: str) -> List[Tuple[int, int, str]]:
 
 
 # =========================
-# DISPLAY policy: reduce noise for QA
+# DISPLAY policy: don't overwhelm QA with low-importance amenity issues
 # =========================
 
 IMPORTANT_AMENITY_CATEGORIES = {
@@ -658,7 +645,7 @@ def claim_present_in_selected_amenities(claim: str, amenities_selected: List[str
 
 
 # =========================
-# COUNT RULE ENGINE
+# GENERIC COUNT RULE ENGINE
 # =========================
 
 def detect_structured_count(flat: Dict[str, Any], key_hints: List[str], key_exclude: List[str]) -> Tuple[Optional[int], Optional[str]]:
@@ -832,6 +819,15 @@ COUNT_RULES = [
         ),
     },
     {
+        "label": "total beds",
+        "issue_type": "Sleeping arrangement mismatch",
+        "severity": "high",
+        "structured_key_hints": ["total_beds", "beds", "bed_count", "num_beds"],
+        "structured_key_exclude": ["bedroom", "bedrooms"],
+        "text_explicit_patterns": [re.compile(r"(?i)\b(\d{1,3}|[A-Za-z]+)\s+beds?\b")],
+        "text_exclude_patterns": [re.compile(r"(?i)\bbedrooms?\b")],
+    },
+    {
         "label": "bedrooms",
         "issue_type": "Room count mismatch",
         "severity": "high",
@@ -916,9 +912,11 @@ def _find_best_field_for_evidence(evidence: str, corpus: Dict[str, str]) -> Opti
     ev = (evidence or "").strip()
     if not ev:
         return None
+
     ev_l = ev.lower()
     best_field = None
     best_idx = None
+
     for field, text in corpus.items():
         t = text or ""
         idx = t.lower().find(ev_l)
@@ -926,34 +924,23 @@ def _find_best_field_for_evidence(evidence: str, corpus: Dict[str, str]) -> Opti
             if best_idx is None or idx < best_idx:
                 best_idx = idx
                 best_field = field
+
     return best_field
 
 def ground_and_locate_llm_issues(
     llm_issues: List[Dict[str, Any]],
     corpus: Dict[str, str],
-    amenities_included: List[str],
-    amenities_not_included: List[str],
+    amenities_selected: List[str],
 ) -> List[Dict[str, Any]]:
-    """
-    Post-process LLM issues:
-      - drop ungrounded
-      - locate correct field
-      - amenity rule: do NOT keep amenity issues if the amenity is NOT listed in included or not_included
-    """
     out: List[Dict[str, Any]] = []
-
-    listed_canons = {canon_amenity(a) for a in (amenities_included or []) + (amenities_not_included or [])}
 
     for it in llm_issues or []:
         issue_type = str(it.get("issue_type", "") or "")
         claim = str(it.get("claim", "") or "")
         evidence = str(it.get("evidence", "") or "").strip()
 
-        if "amenit" in issue_type.lower() or "amenities" in issue_type.lower():
-            canon_guess = guess_issue_amenity_canon(it)
-            if canon_guess and canon_guess not in listed_canons:
-                continue
-            if claim and claim_present_in_selected_amenities(claim, amenities_included):
+        if "amenit" in issue_type.lower():
+            if claim and claim_present_in_selected_amenities(claim, amenities_selected):
                 continue
 
         needle = evidence if evidence else claim
@@ -962,13 +949,13 @@ def ground_and_locate_llm_issues(
             continue
 
         located_field = _find_best_field_for_evidence(needle, corpus)
+
         if located_field is None:
-            if ("amenit" in issue_type.lower() or "amenities" in issue_type.lower()):
-                canon_guess = guess_issue_amenity_canon(it)
-                if canon_guess and canon_guess in listed_canons:
-                    it["field"] = "amenities"
-                    out.append(it)
-            continue
+            if "amenit" in issue_type.lower() and claim_present_in_selected_amenities(needle, amenities_selected):
+                it["field"] = "amenities"
+                out.append(it)
+            else:
+                continue
 
         it["field"] = located_field
 
@@ -995,25 +982,13 @@ def build_ground_truth_pairs(flat: Dict[str, Any]) -> List[Dict[str, Any]]:
         pairs.append({"key": k, "value": v})
     return pairs[:450]
 
-def deterministic_required_amenity_checks(
-    title: str,
-    texts: Dict[str, str],
-    amenities_included: List[str],
-    amenities_not_included: List[str],
-) -> List[Dict[str, Any]]:
-    """
-    KEY RULE (your request):
-      - Do NOT flag amenity inaccuracies if the amenity is not listed in either list.
-      - Only enforce amenity consistency for amenities present in amenities_included or amenities_not_included.
-    """
+def deterministic_required_amenity_checks(title: str, texts: Dict[str, str], amenities_selected: List[str]) -> List[Dict[str, Any]]:
     issues: List[Dict[str, Any]] = []
     display, high_set, _low_set = all_known_amenities()
 
-    included_canons = {canon_amenity(a) for a in (amenities_included or [])}
-    not_included_canons = {canon_amenity(a) for a in (amenities_not_included or [])}
-    listed_canons = included_canons | not_included_canons
-
+    selected = {canon_amenity(a) for a in (amenities_selected or [])}
     corpus = {"title": title, **texts}
+
     surfaced = set(high_set)
 
     for canon in sorted(surfaced):
@@ -1036,37 +1011,31 @@ def deterministic_required_amenity_checks(
                             max_field = field
                             max_evidence = (text[max(0, s-35):min(len(text), e+35)]).strip()
 
-        # Mentioned in text but NOT included -> only flag if amenity is LISTED somewhere
-        if best_mention is not None and canon not in included_canons:
-            if canon not in listed_canons:
-                continue  # <-- your rule
+        if best_mention is not None and canon not in selected:
             f, ev = best_mention
-            gt_label = "Listed as NOT included" if canon in not_included_canons else "Not in included list"
             issues.append({
                 "issue_type": "Amenity mentioned but not selected",
                 "severity": "high",
                 "field": f,
                 "claim": display.get(canon, canon),
-                "ground_truth": gt_label,
+                "ground_truth": "Not in Amenities list",
                 "evidence": ev,
-                "reason": f"{f} mentions '{display.get(canon, canon)}' but it is not in amenities_included."
+                "reason": f"{f} mentions '{display.get(canon, canon)}' but it is not present in the Amenities ground truth."
             })
 
-        # Count mismatch only if included (selected)
-        if max_count is not None and canon in included_canons:
+        if max_count is not None and canon in selected:
             issues.append({
                 "issue_type": "Amenity count mismatch",
                 "severity": "medium",
                 "field": max_field or "text",
                 "claim": f"{max_count}× {display.get(canon, canon)}",
-                "ground_truth": f"Included amenities has '{display.get(canon, canon)}' (single selection)",
+                "ground_truth": f"Amenities includes '{display.get(canon, canon)}' (single selection)",
                 "evidence": max_evidence or display.get(canon, canon),
-                "reason": f"{max_field or 'Text'} suggests {max_count} {display.get(canon, canon)}(s), but amenities_included only indicates it is selected once."
+                "reason": f"{max_field or 'Text'} suggests {max_count} {display.get(canon, canon)}(s), but the amenities ground truth only indicates the amenity is selected (no multiple units)."
             })
 
-    # Selected-but-not-mentioned remains valid because it IS listed (included)
     combined_text = " ".join([title] + list(texts.values())).lower()
-    for canon in sorted(included_canons):
+    for canon in sorted(selected):
         if canon not in surfaced:
             continue
         if not find_amenity_hits(combined_text, canon):
@@ -1075,12 +1044,11 @@ def deterministic_required_amenity_checks(
                 "severity": "medium",
                 "field": "amenities",
                 "claim": display.get(canon, canon),
-                "ground_truth": "Selected in amenities_included",
+                "ground_truth": "Selected in Amenities list",
                 "evidence": display.get(canon, canon),
-                "reason": f"amenities_included contains '{display.get(canon, canon)}' but it is not mentioned in the title/text fields."
+                "reason": f"Amenities includes '{display.get(canon, canon)}' but it is not mentioned in the title/text fields."
             })
 
-    # Title stuffing unchanged
     high_in_title = []
     for canon in sorted(high_set):
         if find_amenity_hits(title, canon):
@@ -1102,8 +1070,7 @@ def run_llm_checker(
     flat: Dict[str, Any],
     title: str,
     texts: Dict[str, str],
-    amenities_included: List[str],
-    amenities_not_included: List[str],
+    amenities_selected: List[str],
     exclusive_keys: List[str],
     api_key: str,
     model: str,
@@ -1115,16 +1082,11 @@ def run_llm_checker(
 
     payload = {
         "ground_truth_pairs": gt_pairs,
-        "amenities_included": amenities_included,
-        "amenities_not_included": amenities_not_included,
+        "amenities_selected": amenities_selected,
         "text_fields": {"title": title, **texts},
         "high_intent_amenities": HIGH_INTENT_AMENITIES,
         "low_priority_amenities": LOW_PRIORITY_AMENITIES,
         "exclusive_fields": exclusive_payload,
-        "policy_notes": [
-            "Only flag amenity inconsistencies if the amenity is listed in amenities_included or amenities_not_included.",
-            "If an amenity is not listed in either list, do NOT flag it as missing/incorrect.",
-        ],
         "pitfalls": [
             "Sometimes numbers refer to parking capacity or hot tub capacity; do NOT treat those as max guest capacity.",
         ],
@@ -1149,8 +1111,6 @@ def run_llm_checker(
     system = (
         "You are a discrepancy checker. Return ONLY valid JSON with keys: field_mapping, issues.\n"
         "Be conservative: only flag when evidence clearly supports the claim.\n"
-        "AMENITIES RULE: Only flag amenity inconsistencies for amenities present in amenities_included or amenities_not_included.\n"
-        "If an amenity is not listed in either list, do NOT flag it.\n"
         "Ignore numbers that refer to parking capacity or hot tub capacity when assessing max guests.\n"
         "Exclusive rule: house_rules content should only exist in house_rules and not in other text fields.\n"
         "Each issue must include: issue_type, severity(high/medium/low), field, reason, evidence, claim(optional), ground_truth(optional)."
@@ -1166,9 +1126,9 @@ def run_llm_checker(
     mapping = out.get("field_mapping") or {}
 
     corpus = build_corpus(title, texts)
-    llm_issues = ground_and_locate_llm_issues(llm_issues_raw, corpus, amenities_included, amenities_not_included)
+    llm_issues = ground_and_locate_llm_issues(llm_issues_raw, corpus, amenities_selected)
 
-    det_issues = deterministic_required_amenity_checks(title, texts, amenities_included, amenities_not_included)
+    det_issues = deterministic_required_amenity_checks(title, texts, amenities_selected)
     count_issues = run_count_rules(flat=flat, corpus=corpus, rules=COUNT_RULES)
 
     merged = []
@@ -1254,6 +1214,13 @@ def render_issue_cards(issues: List[Dict[str, Any]], title: str, texts: Dict[str
                 )
 
 def dedupe_issues_for_display(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    UI-only: if the same issue shows up for multiple fields, keep it once.
+    Preference:
+      - higher severity first
+      - prefer non-'amenities' field if duplicates exist
+      - prefer 'title' then 'summary' then others
+    """
     def norm(s: Any) -> str:
         return normalize_ws("" if s is None else str(s)).lower()
 
@@ -1313,17 +1280,25 @@ def main():
 
     if use_sample and not upload:
         data = {
-            "title": "Cozy villa with hot tub — sleeps 4",
+            "title": "Cozy villa with 2 hot tubs, private pool, sauna, and EV charger — sleeps 4",
             "max_guests": 6,
             "bedrooms": 2,
             "bathrooms": 1,
             "property_type": "apartment",
-            "amenities_included": ["Hot tub", "Wifi", "BBQ grill"],
-            "amenities_not_included": ["Pool", "Sauna"],
-            "house_rules": {"During your stay": ["No parties", "Quiet hours after 10pm"]},
-            "summary": "A stylish apartment. Extra guest fee applies.",
-            "the_space": "Sleeps 4. Hot tub. BBQ available.",
-            "reviews": [{"text": "Great place!"}, {"text": "Loved it."}]
+            "Amenities": ["Hot tub", "Shared pool", "Wifi"],
+            "house_rules": {
+                "Before you leave": [
+                    "Gather used towels",
+                    "Throw trash away",
+                    "Turn things off",
+                    "Return keys",
+                    "Lock up",
+                    "Additional requests",
+                ],
+            },
+            "summary": "A stylish apartment with shared pool. Extra guest fee applies.",
+            "the_space": "Sleeps 4. Two hot tubs and a private pool. Pet friendly! Perfect villa getaway.",
+            "reviews": [{"text": "Great place!"}, {"text": "Loved the pool."}]
         }
     elif upload:
         try:
@@ -1343,26 +1318,29 @@ def main():
         st.error("JSON root must be an object (dict).")
         return
 
+    # Extract house_rules from original JSON (dict/list/string supported)
+    house_rules_obj = find_node_by_key(data, "house_rules")
+
     flat = flatten_json(data)
 
-    # Amenities (new keys)
-    amenities_included, amenities_not_included = extract_amenities_included_not_included(data)
-
-    # House rules text (for exclusive field + QA text box)
-    house_rules_obj = find_node_by_key(data, "house_rules")
-    house_rules_text_default = house_rules_to_text(house_rules_obj)
-    flat["house_rules"] = house_rules_text_default
-    house_rules_key = "house_rules"
-    exclusive_keys = [house_rules_key]
+    # Inject stable text into flat so exclusive_keys logic stays consistent
+    if house_rules_obj is not None:
+        flat["house_rules"] = house_rules_to_text(house_rules_obj)
+        house_rules_key = "house_rules"
+    else:
+        house_rules_key = detect_house_rules_key(flat)
 
     title_key = detect_title_key(flat)
+    exclusive_keys = [house_rules_key] if house_rules_key else []
 
-    # Remove description from UI
+    # Remove "description" from Streamlit app (per feedback)
     text_keys = choose_editable_text_keys(flat, title_key=title_key, house_rules_key=house_rules_key)
     text_keys = [k for k in text_keys if normalize_key(k) != "description"]
 
     readonly_reviews = build_readonly_reviews(flat)
+
     title_val = str(flat.get(title_key, "")) if title_key else ""
+    amenities_val = extract_all_amenities(data)
 
     st.header("Editable listing text")
     c1, c2 = st.columns([1, 1], gap="large")
@@ -1371,13 +1349,9 @@ def main():
         st.subheader("Title")
         title_edit = st.text_input("Title", value=title_val, key="__title")
 
-        st.subheader("Amenities included (ground truth)")
-        st.caption(f"Detected {len(amenities_included)}")
-        safe_df(pd.DataFrame({"amenity": amenities_included})) if amenities_included else st.write("—")
-
-        st.subheader("Amenities not included (reference)")
-        st.caption(f"Detected {len(amenities_not_included)}")
-        safe_df(pd.DataFrame({"amenity": amenities_not_included})) if amenities_not_included else st.write("—")
+        st.subheader("Amenities (ground truth)")
+        st.caption(f"Detected {len(amenities_val)} amenities")
+        safe_df(pd.DataFrame({"amenity": amenities_val})) if amenities_val else st.write("—")
 
     with c2:
         edited_texts: Dict[str, str] = {}
@@ -1396,27 +1370,18 @@ def main():
                     st.markdown(f"**{k} (read-only)**")
                     st.code(txt[:4000])
 
-        # ✅ House rules textbox ONLY (below reviews) — per your request
-        st.subheader("House rules (text box for QA testing)")
-        house_rules_text_edit = st.text_area(
-            "House rules",
-            value=house_rules_text_default,
-            height=220,
-            key="__house_rules_edit",
-            help="Edit here to test the checker. Used in the LLM payload as the exclusive house_rules field.",
-        )
+        # ✅ House rules below reviews (your request)
+        st.subheader("House rules (read-only)")
+        render_house_rules_readonly(house_rules_obj)
 
     all_texts_for_checking = {**edited_texts, **readonly_reviews}
 
     def run_once():
-        flat["house_rules"] = str(house_rules_text_edit or "")
-
         issues, mapping = run_llm_checker(
             flat=flat,
             title=title_edit,
             texts=all_texts_for_checking,
-            amenities_included=amenities_included,
-            amenities_not_included=amenities_not_included,
+            amenities_selected=amenities_val,
             exclusive_keys=exclusive_keys,
             api_key=OPENAI_API_KEY,
             model=OPENAI_MODEL,
@@ -1444,11 +1409,8 @@ def main():
 
     issues = current["issues"]
 
-    show_all_issues = st.sidebar.checkbox(
-        "Show all issues (including low-importance amenities)",
-        value=False
-    )
 
+    # UI-only filtering + UI-only dedupe (so QA isn't overwhelmed)
     issues_display = filter_issues_for_qa(issues, show_all=show_all_issues)
     issues_display = dedupe_issues_for_display(issues_display)
 
@@ -1479,7 +1441,6 @@ def main():
         st.session_state["runs"] = []
         st.session_state["current"] = None
         st.rerun()
-
 
 if __name__ == "__main__":
     main()
