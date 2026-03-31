@@ -7,6 +7,11 @@ import streamlit as st
 import os
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+if not OPENAI_API_KEY:
+    st.error("OpenAI API key not found. Add OPENAI_API_KEY to Streamlit secrets.")
+    st.stop()
+OPENAI_MODEL = "gpt-5.2"
+
 # =========================
 # AMENITIES (PRIORITY LISTS)
 # =========================
