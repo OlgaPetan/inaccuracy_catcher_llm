@@ -7,12 +7,6 @@ import streamlit as st
 import os
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
-if not OPENAI_API_KEY:
-    st.error("OpenAI API key not found. Add OPENAI_API_KEY to Streamlit secrets.")
-    st.stop()
-
-OPENAI_MODEL = "gpt-5.2"
-
 # =========================
 # AMENITIES (PRIORITY LISTS)
 # =========================
@@ -63,9 +57,9 @@ LOW_PRIORITY_AMENITIES = {
         "Refrigerator", "Freezer", "Mini fridge", "Rice maker", "Toaster",
         "Dishwasher", "Coffee maker", "Private entrance", "Luggage dropoff allowed",
         "Long term stays allowed", "Hair dryer", "Iron", "Safe", "Crib",
-        "High chair", "Children’s books and toys", "Baby bath", "Baby monitor",
-        "Baby safety gates", "Changing table", "Pack ’n play / Travel crib",
-        "Babysitter recommendations", "Children’s dinnerware",
+        "High chair", "Children's books and toys", "Baby bath", "Baby monitor",
+        "Baby safety gates", "Changing table", "Pack 'n play / Travel crib",
+        "Babysitter recommendations", "Children's dinnerware",
     ]
 }
 
@@ -429,12 +423,51 @@ def parse_number_maybe(x: Any) -> Optional[float]:
 
 
 # =========================
-# AMENITY MATCHING (SELECTABLE SET + SAFE SOFT MATCH)
+# FUZZY TEXT MATCHING (NEW)
 # =========================
 
+def normalize_text_for_matching(text: str) -> str:
+    """Normalize text for fuzzy matching: lowercase, remove punctuation, normalize whitespace"""
+    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', ' ', (text or '').lower())).strip()
+
+def stem_word(word: str) -> str:
+    """Basic stemming: remove trailing 's' for plural handling"""
+    return word.rstrip('s') if len(word) > 2 else word
+
+def fuzzy_text_contains(needle: str, haystack: str) -> bool:
+    """
+    Check if needle appears in haystack with fuzzy matching.
+    Handles: punctuation variations, plurals, case differences.
+    """
+    if not needle or not haystack:
+        return False
+    
+    norm_needle = normalize_text_for_matching(needle)
+    norm_haystack = normalize_text_for_matching(haystack)
+    
+    # Direct substring match after normalization
+    if norm_needle in norm_haystack:
+        return True
+    
+    # Word-by-word matching with stemming
+    needle_words = [stem_word(w) for w in norm_needle.split()]
+    haystack_words = [stem_word(w) for w in norm_haystack.split()]
+    
+    # All needle words (stemmed) must appear in haystack
+    return all(
+        any(needle_word == haystack_word for haystack_word in haystack_words)
+        for needle_word in needle_words
+    )
+
+
+# =========================
+# AMENITY MATCHING (IMPROVED)
+# =========================
+
+# Expanded synonyms to handle access-related amenities and parking variations
 AMENITY_SYNONYMS = {
     "hot tub": ["hot tub", "hot tubs", "jacuzzi", "spa tub", "whirlpool", "spa"],
-    "pool": ["pool", "pools", "swimming pool", "swimming pools"],
+    "pool": ["pool", "pools", "swimming pool", "swimming pools", "pool access"],
     "bbq grill": ["bbq", "barbecue", "bbq grill", "grill", "grills"],
     "dedicated workspace": ["dedicated workspace", "workspace", "work desk", "desk"],
     "ev charger": ["ev charger", "electric vehicle charger", "tesla charger"],
@@ -443,6 +476,15 @@ AMENITY_SYNONYMS = {
     "sauna": ["sauna", "saunas"],
     "pool table": ["pool table", "billiards", "billiard table"],
     "ping pong table": ["ping pong table", "table tennis"],
+    # Access-related amenities
+    "lake access": ["lake access", "access to lake", "access to the lake", "lakefront", "lake front"],
+    "beach access": ["beach access", "access to beach", "access to the beach", "beachfront", "beach front"],
+    "resort access": ["resort access", "access to resort", "access to the resort", "resort amenities", "resort facilities", "resort"],
+    "waterfront": ["waterfront", "water front"],
+    # Parking variations
+    "free parking on premises": ["free parking on premises", "free parking", "parking on site", "onsite parking", "on-site parking", "complimentary parking", "parking"],
+    "free street parking": ["free street parking", "street parking"],
+    "paid parking on premises": ["paid parking on premises", "paid parking", "parking"],
 }
 
 _AMENITY_MODIFIER_TOKENS = {
@@ -453,7 +495,7 @@ _AMENITY_MODIFIER_TOKENS = {
 
 def normalize_amenity_phrase(s: str) -> str:
     t = (s or "").lower()
-    t = t.replace("’", "'")
+    t = t.replace("'", "'")
     t = re.sub(r"[–—]", " ", t)
     t = re.sub(r"[^a-z0-9\s/]+", " ", t)
     return normalize_ws(t)
@@ -473,34 +515,66 @@ def _whole_word_contains(hay: str, needle: str) -> bool:
 
 def amenity_soft_match(a: str, b: str) -> bool:
     """
-    Variation tolerant but NOT substring-inside-word tolerant.
-    Fixes Kitchen vs Kitchenette false match.
+    Improved variation tolerant matching using fuzzy logic.
+    Now handles: "free parking" vs "parking", "lake access" vs "access", "Lake view" vs "Lake Views!"
     """
     if not a or not b:
         return False
+    
+    # Use fuzzy matching first
+    if fuzzy_text_contains(a, b) or fuzzy_text_contains(b, a):
+        return True
+    
     a_norm = normalize_amenity_phrase(a)
     b_norm = normalize_amenity_phrase(b)
 
     if a_norm == b_norm:
         return True
 
-    # whole-word contain (not inside another word)
+    # Whole-word contain (not inside another word)
     if _whole_word_contains(a_norm, b_norm) or _whole_word_contains(b_norm, a_norm):
         return True
 
+    # Token-based matching with improved logic
     at = set(amenity_tokens(a_norm))
     bt = set(amenity_tokens(b_norm))
     if not at or not bt:
         return False
-    return at.issubset(bt) or bt.issubset(at)
+    
+    # If all core tokens of one are in the other, it's a match
+    if at.issubset(bt) or bt.issubset(at):
+        return True
+    
+    # For access-related amenities, check if the core amenity word is present
+    access_variants = ["access", "front"]
+    for variant in access_variants:
+        if variant in at or variant in bt:
+            # Remove access/front tokens and check if remaining tokens match
+            at_core = at - {variant, "to", "the"}
+            bt_core = bt - {variant, "to", "the"}
+            if at_core and bt_core and (at_core.issubset(bt_core) or bt_core.issubset(at_core)):
+                return True
+    
+    return False
 
 def canon_amenity(a: str) -> str:
+    """Convert amenity to canonical form, handling variations better"""
     a0 = normalize_amenity_phrase(a)
+    
+    # First try exact synonym matches
+    for canon, syns in AMENITY_SYNONYMS.items():
+        for s in syns:
+            s0 = normalize_amenity_phrase(s)
+            if a0 == s0:
+                return canon
+    
+    # Then try whole-word contains for more flexible matching
     for canon, syns in AMENITY_SYNONYMS.items():
         for s in syns:
             s0 = normalize_amenity_phrase(s)
             if _whole_word_contains(a0, s0):
                 return canon
+    
     return a0
 
 def all_known_amenities() -> Tuple[Dict[str, str], set, set]:
@@ -520,25 +594,84 @@ def all_known_amenities() -> Tuple[Dict[str, str], set, set]:
     return display, high, low
 
 def selectable_amenity_set() -> set:
-    """Your “selectable Airbnb amenities” proxy: union of HIGH + LOW dictionaries."""
+    """Your "selectable Airbnb amenities" proxy: union of HIGH + LOW dictionaries."""
     _display, high, low = all_known_amenities()
     return set(high) | set(low)
 
 def _regex_for_phrase(phrase: str) -> re.Pattern:
+    """
+    Improved regex generation that's less strict about exact spacing.
+    """
     s0 = normalize_amenity_phrase(phrase)
     escaped = re.escape(s0)
-    escaped = escaped.replace("\\ ", r"[\s\-]+")
+    # Allow flexible spacing
+    escaped = escaped.replace("\\ ", r"\s+")
     escaped = escaped.replace("\\/", r"[\s]*\/[\s]*")
     return re.compile(r"(?i)\b" + escaped + r"\b")
 
 def find_amenity_hits(text: str, canon: str) -> List[Tuple[int, int, str]]:
+    """
+    Find amenity mentions in text with improved fuzzy matching.
+    Now correctly handles "Lake view" vs "Lake Views!" and prevents false positives.
+    """
     t = text or ""
     syns = AMENITY_SYNONYMS.get(canon, [canon])
     hits = []
+    
     for s in syns:
-        pat = _regex_for_phrase(s)
-        for m in pat.finditer(t):
-            hits.append((m.start(), m.end(), t[m.start():m.end()]))
+        # Multi-word amenities: match full phrase with fuzzy logic
+        if " " in s:
+            # Try exact pattern first
+            pat = _regex_for_phrase(s)
+            for m in pat.finditer(t):
+                hits.append((m.start(), m.end(), t[m.start():m.end()]))
+            
+            # If no exact match, try fuzzy matching
+            if not hits:
+                # Normalize both the synonym and text
+                norm_syn = normalize_text_for_matching(s)
+                norm_text = normalize_text_for_matching(t)
+                syn_words = [stem_word(w) for w in norm_syn.split()]
+                
+                # Search for the phrase in the normalized text
+                if norm_syn in norm_text:
+                    # Find the position in the original text
+                    idx = norm_text.find(norm_syn)
+                    # Map back to original text position (approximate)
+                    char_count = 0
+                    for i, char in enumerate(t):
+                        if char.isalnum() or char.isspace():
+                            if char_count == idx:
+                                start = i
+                                break
+                            if normalize_text_for_matching(char):
+                                char_count += 1
+                    else:
+                        start = 0
+                    
+                    # Find end position
+                    end = start + len(s)
+                    # Adjust to find actual end in original text
+                    while end < len(t) and not t[end-1].isalnum():
+                        end -= 1
+                    
+                    if start < end:
+                        hits.append((start, end, t[start:end]))
+        else:
+            # Single-word amenities: strict word boundaries with plural support
+            pat = re.compile(r"(?i)\b" + re.escape(s) + r"s?\b")
+            for m in pat.finditer(t):
+                # Ensure not part of compound word
+                match_start = m.start()
+                match_end = m.end()
+                
+                if match_start > 0 and t[match_start - 1].isalnum():
+                    continue
+                if match_end < len(t) and t[match_end].isalnum():
+                    continue
+                    
+                hits.append((match_start, match_end, t[match_start:match_end]))
+    
     hits.sort(key=lambda x: x[0])
     return hits
 
@@ -937,7 +1070,7 @@ def deterministic_amenity_checks(
 
     # 3) Mentioned but not selected (only for selectable amenities; includes gym)
     # We only iterate selectable amenities we *care* about surfacing (high intent),
-    # but this still correctly captures “gym missing” and avoids “tennis court”.
+    # but this still correctly captures "gym missing" and avoids "tennis court".
     for canon in sorted(high_set):
         best_mention = None
         for field, text in corpus.items():
@@ -1097,7 +1230,7 @@ def ground_and_locate_llm_issues(
     for it in llm_issues or []:
         f, ev = _anchor_evidence(it, corpus)
         if not f or not ev:
-            # drop ungrounded “phantom” issues
+            # drop ungrounded "phantom" issues
             continue
         it["field"] = f
         it["evidence"] = ev
@@ -1309,7 +1442,7 @@ def dedupe_issues_for_display(issues: List[Dict[str, Any]]) -> List[Dict[str, An
 
 def main():
     st.set_page_config(page_title="JSON Discrepancy Checker — LLM", layout="wide")
-    st.title("JSON Discrepancy Checker — LLM semantic")
+    st.title("JSON Discrepancy Checker — LLM semantic (FIXED)")
 
     st.sidebar.header("Upload JSON")
     upload = st.sidebar.file_uploader("JSON file", type=["json"])
